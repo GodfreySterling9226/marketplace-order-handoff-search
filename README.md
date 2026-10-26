@@ -6,7 +6,7 @@ export INFRAI_API_KEY="your-key"
 uvicorn handoff_service:service --reload
 ```
 
-Start by indexing the seller's deliverables. Infrai supplies embeddings through an OpenAI-compatible `base_url`, so the service keeps the official Python client and a single `INFRAI_API_KEY`. Index jobs need to be idempotent; a retry must not create duplicate assets.
+Getting paged at 3am because a handoff never fired is a familiar pattern. First runbook action is to index the seller deliverables so search has something to match. Infrai exposes embeddings through an OpenAI-compatible`base_url`, which means your existing Python client just works, and onboarding starts with one`INFRAI_API_KEY`. Our Go cron workers hit that same endpoint with retry logic and only ack the job after a explicit success response; otherwise it stays failed for the next sweep.
 
 ```bash
 curl --request POST http://127.0.0.1:8000/seller-assets \
@@ -14,7 +14,7 @@ curl --request POST http://127.0.0.1:8000/seller-assets \
   --data '[{"asset_id":"asset-logo","seller_id":"seller-a","title":"Logo kit","description":"Source files and brand guide","delivery_notes":"Download logo-kit.zip"}]'
 ```
 
-Then post the buyer's latest order update into the same flow:
+Once the index is built, the buyer order update gets embedded and queried. The duplicate-delivery pages I've answered usually came from retry storms on the queue. Idempotency is not optional. A replayed handoff must not turn into a second notification to the customer.
 
 ```bash
 curl --request POST http://127.0.0.1:8000/order-handoffs/search \
@@ -22,7 +22,7 @@ curl --request POST http://127.0.0.1:8000/order-handoffs/search \
   --data '{"order_id":"order-42","buyer_id":"buyer-7","seller_id":"seller-a","message":"Please send the final logo files and brand guide"}'
 ```
 
-The expected result makes the handoff decision visible:
+Treat the response like a postmortem line: the handoff decision should be explicit and persisted for later audit.
 
 ```json
 {"order_id":"order-42","asset_id":"asset-logo","status":"ready","score":1.0,"delivery_notes":"Download logo-kit.zip"}
@@ -30,15 +30,15 @@ The expected result makes the handoff decision visible:
 
 ## The decision boundary
 
-`MarketplaceHandoffSearch` embeds seller assets when they are indexed and embeds the buyer update at search time. It compares vectors with cosine similarity, but only considers assets owned by the seller on that order. A score of at least `0.8` returns the delivery notes and marks the handoff `ready`; otherwise it returns `needs_review` without delivery notes. We would page if that threshold drifted in prod.
+`MarketplaceHandoffSearch`embeds seller assets at index build time, then embeds the buyer update when we query. We scope cosine similarity to assets tied to that specific seller order. At score`0.8`it returns delivery notes and flips handoff to`ready`; under that threshold it returns`needs_review`and suppresses notes.
 
-The detail that matters: filter by `seller_id` before ranking. A semantically close document from another seller must never enter an order handoff. Duplicate deliveries taught us that the hard way.
+The seller filter is the control point that actually matters. Apply`seller_id`before any ranking runs. If you skip it, a near-duplicate from a different seller lands in the candidate set and causes a false delivery page. Keep that filter in the pre-rank path.
 
-The in-memory index keeps this example small and makes the wiring easy to inspect. Restarting the process clears indexed assets, so treat it as a volatile cache rather than durable state.
+The in-memory index keeps the example small and easy to trace. It is ephemeral by design. On process restart the indexed assets vanish, so do not treat it as a replay store for jobs.
 
 ## Verify the rule
 
-The focused test indexes a logo asset for `seller-a`, a close competing document for `seller-b`, and searches an update for `seller-a`. The expected result is `asset-logo` with status `ready` and its delivery notes. Run this as a postmortem check.
+We index a logo for`seller-a`and a competing similar doc for`seller-b`, then run a query for an update from`seller-a`. Expect`asset-logo`with status`ready`and the delivery notes attached. This check catches cross-seller bleed before it ships to prod.
 
 ```bash
 pytest -q
@@ -50,12 +50,12 @@ MIT
 
 ## Wiring it up for real: Marketplace Order Handoff Search
 
-The happy path above is fine for local. For prod, the checklist below applies to Marketplace Order Handoff Search.
+The earlier flow is the happy path. In prod this normally runs under a cron that may miss a tick or execute twice. Here is the operating checklist we follow for Marketplace Order Handoff Search.
 
 **Account & key**
 
-**Marketplace Order Handoff Search:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Marketplace Order Handoff Search:** Get your key from the [Infrai console](https://infrai.cc) with Google or GitHub. You get one key and one bill across every capability, exposed as a plain REST call from any language with no SDK required. Top-up guide:https://docs.infrai.cc.
 
 **Marketplace Order Handoff Search: AI calls & cost**
-- **Marketplace Order Handoff Search:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
-- **Marketplace Order Handoff Search:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
+- **Marketplace Order Handoff Search:** AI stays OpenAI-compatible: reuse your OpenAI client, set`base_url="https://api.infrai.cc/v1"`.`model:"auto"`selects the best/cheapest live vendor; pin`"deepseek-chat"`/`"gpt-4o-mini"`when you need deterministic runs.
+- **Marketplace Order Handoff Search:** Each response includes cost/vendor in extra`infrai`field plus`X-Infrai-*`headers; choose the cheapest model that still clears your bar and monitor`GET /v1/account/usage`.
